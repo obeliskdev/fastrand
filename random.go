@@ -3,12 +3,15 @@ package fastrand
 import (
 	crand "crypto/rand"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"math/bits"
 	"math/rand/v2"
 	"net"
+	"sync/atomic"
+	"sync"
 	"time"
 	"unsafe"
 )
@@ -34,8 +37,9 @@ type number interface {
 }
 
 var (
-	pcgSrc       *rand.Rand
 	chaChaSrc    *rand.Rand
+	chaChaMu     sync.Mutex
+	fastState    atomic.Uint64
 	FastReader   io.Reader
 	SecureReader io.Reader
 )
@@ -51,8 +55,7 @@ func init() {
 		seed1 = binary.LittleEndian.Uint64(seedBytes[:8])
 		seed2 = binary.LittleEndian.Uint64(seedBytes[8:])
 	}
-	pcgSource := rand.NewPCG(seed1, seed2)
-	pcgSrc = rand.New(pcgSource)
+	fastState.Store(seed1 ^ bits.RotateLeft64(seed2, 17))
 
 	var chachaSeed [32]byte
 	if _, err := crand.Read(chachaSeed[:]); err != nil {
@@ -65,19 +68,19 @@ func init() {
 	chaChaSource := rand.NewChaCha8(chachaSeed)
 	chaChaSrc = rand.New(chaChaSource)
 
-	FastReader = &randReader{src: pcgSource}
-	SecureReader = &randReader{src: chaChaSource}
+	FastReader = &randReader{next: fastUint64}
+	SecureReader = &randReader{next: secureUint64}
 }
 
 type randReader struct {
-	src rand.Source
+	next func() uint64
 }
 
 func (r *randReader) Read(p []byte) (n int, err error) {
 	n = len(p)
 	read := 0
 	for read < n {
-		val := r.src.Uint64()
+		val := r.next()
 		remaining := n - read
 		if remaining >= 8 {
 			binary.LittleEndian.PutUint64(p[read:], val)
@@ -92,6 +95,37 @@ func (r *randReader) Read(p []byte) (n int, err error) {
 	return n, nil
 }
 
+// splitmix64 step: fast, lock-free non-crypto generator.
+func fastUint64() uint64 {
+	z := fastState.Add(0x9e3779b97f4a7c15)
+	z ^= z >> 30
+	z *= 0xbf58476d1ce4e5b9
+	z ^= z >> 27
+	z *= 0x94d049bb133111eb
+	z ^= z >> 31
+	return z
+}
+
+func secureUint64() uint64 {
+	chaChaMu.Lock()
+	v := chaChaSrc.Uint64()
+	chaChaMu.Unlock()
+	return v
+}
+
+func fastUint64N(n uint64) uint64 {
+	if n == 0 {
+		panic("fastrand: argument n must be positive")
+	}
+	threshold := -n % n
+	for {
+		hi, lo := bits.Mul64(fastUint64(), n)
+		if lo >= threshold {
+			return hi
+		}
+	}
+}
+
 func Int(min, max int) int {
 	if min > max {
 		panic(fmt.Sprintf("fastrand: invalid integer range [%d, %d]", min, max))
@@ -99,14 +133,15 @@ func Int(min, max int) int {
 	if min == max {
 		return min
 	}
-	return min + pcgSrc.IntN(max-min+1)
+	v := int(fastUint64N(uint64(max - min + 1)))
+	return min + v
 }
 
 func IntN(n int) int {
 	if n <= 0 {
 		panic("fastrand: argument n must be positive")
 	}
-	return pcgSrc.IntN(n)
+	return int(fastUint64N(uint64(n)))
 }
 
 func Bytes(length int) []byte {
@@ -124,7 +159,16 @@ func Bytes(length int) []byte {
 }
 
 func Hex(length int) string {
-	return fmt.Sprintf("%x", Bytes(length))
+	if length < 0 {
+		panic("fastrand: length cannot be negative")
+	}
+	if length == 0 {
+		return ""
+	}
+	src := Bytes(length)
+	dst := make([]byte, hex.EncodedLen(len(src)))
+	hex.Encode(dst, src)
+	return *(*string)(unsafe.Pointer(&dst))
 }
 
 func SecureHex(length int) (string, error) {
@@ -132,7 +176,9 @@ func SecureHex(length int) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("fastrand: failed to generate secure hex: %w", err)
 	}
-	return fmt.Sprintf("%x", bytes), nil
+	dst := make([]byte, hex.EncodedLen(len(bytes)))
+	hex.Encode(dst, bytes)
+	return *(*string)(unsafe.Pointer(&dst)), nil
 }
 
 func String(length int, charset CharsList) string {
@@ -198,7 +244,7 @@ func ChoiceMultiple[T any](items []T, count int) []T {
 	if count <= 0 || count >= n {
 		shuffled := make([]T, n)
 		copy(shuffled, items)
-		pcgSrc.Shuffle(n, func(i, j int) {
+		Shuffle(n, func(i, j int) {
 			shuffled[i], shuffled[j] = shuffled[j], shuffled[i]
 		})
 		return shuffled
@@ -211,7 +257,7 @@ func ChoiceMultiple[T any](items []T, count int) []T {
 		indices[i] = i
 	}
 
-	pcgSrc.Shuffle(n, func(i, j int) {
+	Shuffle(n, func(i, j int) {
 		indices[i], indices[j] = indices[j], indices[i]
 	})
 
@@ -231,11 +277,12 @@ func IPv6() net.IP {
 }
 
 func Float64() float64 {
-	return pcgSrc.Float64()
+	const denom = 1.0 / (1 << 53)
+	return float64(fastUint64()>>11) * denom
 }
 
 func Byte() byte {
-	return byte(pcgSrc.Uint64())
+	return byte(fastUint64())
 }
 
 func Number[T number](min, max T) T {
@@ -248,16 +295,20 @@ func Number[T number](min, max T) T {
 	switch any(min).(type) {
 	case float32:
 		fmin, fmax := float32(min), float32(max)
-		return T(fmin + pcgSrc.Float32()*(fmax-fmin))
+		v := T(fmin + float32(Float64())*(fmax-fmin))
+		return v
 	case float64:
 		fmin, fmax := float64(min), float64(max)
-		return T(fmin + pcgSrc.Float64()*(fmax-fmin))
+		v := T(fmin + Float64()*(fmax-fmin))
+		return v
 	case int, int8, int16, int32, int64:
 		imin, imax := int64(min), int64(max)
-		return T(imin + pcgSrc.Int64N(imax-imin+1))
+		v := T(imin + int64(fastUint64N(uint64(imax-imin+1))))
+		return v
 	case uint, uint8, uint16, uint32, uint64:
 		umin, umax := uint64(min), uint64(max)
-		return T(umin + pcgSrc.Uint64N(umax-umin+1))
+		v := T(umin + fastUint64N(umax-umin+1))
+		return v
 	default:
 		panic(fmt.Sprintf("fastrand: unsupported type %T", min))
 	}
@@ -272,11 +323,13 @@ func NumberN[T number](n T) T {
 }
 
 func Shuffle(n int, swap func(i, j int)) {
-	pcgSrc.Shuffle(n, swap)
+	r := rand.New(rand.NewPCG(fastUint64(), fastUint64()))
+	r.Shuffle(n, swap)
 }
 
 func Perm(n int) []int {
-	return pcgSrc.Perm(n)
+	r := rand.New(rand.NewPCG(fastUint64(), fastUint64()))
+	return r.Perm(n)
 }
 
 func SecureInt(min, max int) (int, error) {
@@ -297,7 +350,10 @@ func SecureIntN(n int) (int, error) {
 	if n <= 0 {
 		return 0, errors.New("fastrand: argument n must be positive for SecureIntN")
 	}
-	return chaChaSrc.IntN(n), nil
+	chaChaMu.Lock()
+	v := chaChaSrc.IntN(n)
+	chaChaMu.Unlock()
+	return v, nil
 }
 
 func SecureBytes(length int) ([]byte, error) {
@@ -328,13 +384,12 @@ func SecureString(length int, charset CharsList) (string, error) {
 
 	b := make([]byte, length)
 
+	chaChaMu.Lock()
 	for i := range b {
-		idx, err := SecureIntN(csLen)
-		if err != nil {
-			return "", fmt.Errorf("fastrand: error getting secure index for string: %w", err)
-		}
+		idx := chaChaSrc.IntN(csLen)
 		b[i] = charset[idx]
 	}
+	chaChaMu.Unlock()
 
 	return *(*string)(unsafe.Pointer(&b)), nil
 }
@@ -358,11 +413,17 @@ func SecureIPv6() (net.IP, error) {
 }
 
 func SecureFloat64() float64 {
-	return chaChaSrc.Float64()
+	chaChaMu.Lock()
+	v := chaChaSrc.Float64()
+	chaChaMu.Unlock()
+	return v
 }
 
 func SecureByte() byte {
-	return byte(chaChaSrc.Uint64())
+	chaChaMu.Lock()
+	v := byte(chaChaSrc.Uint64())
+	chaChaMu.Unlock()
+	return v
 }
 
 func SecureNumber[T number](min, max T) (T, error) {
@@ -376,17 +437,27 @@ func SecureNumber[T number](min, max T) (T, error) {
 	switch any(min).(type) {
 	case float32:
 		fmin, fmax := float32(min), float32(max)
-		return T(fmin + chaChaSrc.Float32()*(fmax-fmin)), nil
+		chaChaMu.Lock()
+		v := T(fmin + chaChaSrc.Float32()*(fmax-fmin))
+		chaChaMu.Unlock()
+		return v, nil
 	case float64:
 		fmin, fmax := float64(min), float64(max)
-		return T(fmin + chaChaSrc.Float64()*(fmax-fmin)), nil
+		chaChaMu.Lock()
+		v := T(fmin + chaChaSrc.Float64()*(fmax-fmin))
+		chaChaMu.Unlock()
+		return v, nil
 	case int, int8, int16, int32, int64:
 		imin, imax := int64(min), int64(max)
+		chaChaMu.Lock()
 		randVal := chaChaSrc.Int64N(imax - imin + 1)
+		chaChaMu.Unlock()
 		return T(imin + randVal), nil
 	case uint, uint8, uint16, uint32, uint64:
 		umin, umax := uint64(min), uint64(max)
+		chaChaMu.Lock()
 		randVal := chaChaSrc.Uint64N(umax - umin + 1)
+		chaChaMu.Unlock()
 		return T(umin + randVal), nil
 	default:
 		var zero T
