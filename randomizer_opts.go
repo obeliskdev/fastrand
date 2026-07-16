@@ -53,8 +53,28 @@ func NewEngine(opts ...Option) *FastEngine {
 }
 
 func (e *FastEngine) Reset() {
-	freshEngine := NewEngine()
-	*e = *freshEngine
+	e.defaultLength = 16
+	e.minLength = 1
+	e.maxLength = 99
+	e.inputEncoding = RandomizerEncodingURL | RandomizerEncodingHTML
+	e.outputEncoding = RandomizerEncodingNone
+	e.rangesEnabled = true
+	e.keywordChoicesEnabled = true
+	e.lengthChoicesEnabled = true
+	e.mailProviders = SafeMailProviders
+	for k := range e.enabledKeywords {
+		e.enabledKeywords[k] = true
+	}
+	for k := range e.customCharsets {
+		delete(e.customCharsets, k)
+	}
+	for k := range e.customKeywords {
+		delete(e.customKeywords, k)
+	}
+}
+
+func (e *FastEngine) MailProviders() []string {
+	return e.mailProviders
 }
 
 func WithDefaultLength(length int) Option {
@@ -89,10 +109,16 @@ func WithDisabledKeywords(keywords ...string) Option {
 	}
 }
 
-func WithMailProviders(providers []string) Option {
+func WithMailProviders(providers ...string) Option {
 	return func(e *FastEngine) {
-		if len(providers) > 0 {
-			e.mailProviders = providers
+		filtered := make([]string, 0, len(providers))
+		for _, p := range providers {
+			if p != "" {
+				filtered = append(filtered, p)
+			}
+		}
+		if len(filtered) > 0 {
+			e.mailProviders = filtered
 		}
 	}
 }

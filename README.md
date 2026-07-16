@@ -285,7 +285,7 @@ engine := fastrand.NewEngine(
 		return []byte("prod")
 	}),
 	fastrand.WithCustomCharset("DIGIT", []byte("01")),
-	fastrand.WithMailProviders([]string{"example.com", "test.org"}),
+	fastrand.WithMailProviders("example.com", "test.org"),
 	fastrand.WithInputEncoding(fastrand.RandomizerEncodingURL),
 	fastrand.WithOutputEncoding(fastrand.RandomizerEncodingHTML),
 	fastrand.WithRanges(false),
@@ -302,7 +302,7 @@ engine := fastrand.NewEngine(
 | `WithDisabledKeywords(kw...)` | Disable specific keywords |
 | `WithCustomKeyword(kw, fn)` | Register a custom keyword generator |
 | `WithCustomCharset(kw, cs)` | Override a keyword's charset |
-| `WithMailProviders(list)` | Override email domain list |
+| `WithMailProviders(providers...)` | Override email domain list |
 | `WithInputEncoding(enc)` | Decode input as URL/HTML encoded |
 | `WithOutputEncoding(enc)` | Encode non-placeholder output |
 | `WithRanges(bool)` | Enable/disable length ranges (default: true) |

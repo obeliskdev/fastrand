@@ -92,6 +92,12 @@ func (r *randReader) Read(p []byte) (n int, err error) {
 	return n, nil
 }
 
+// Uint64 returns a random uint64 using the fast non-crypto generator.
+// Each call is a single atomic add — the cheapest source of randomness.
+func Uint64() uint64 {
+	return fastUint64()
+}
+
 // splitmix64 step: fast, lock-free non-crypto generator.
 func fastUint64() uint64 {
 	z := fastState.Add(0x9e3779b97f4a7c15)
@@ -123,6 +129,53 @@ func fastUint64N(n uint64) uint64 {
 	}
 }
 
+// fastUint16N returns a random uint16 in [0, n). It is faster than
+// fastUint64N for small ranges because it draws only one uint64 and
+// uses a bitmask-based rejection path that avoids the 128-bit
+// multiply.
+func fastUint16N(n uint16) uint16 {
+	if n == 0 {
+		panic("fastrand: argument n must be positive")
+	}
+	if n == 1 {
+		return 0
+	}
+	// For power-of-two n use masking directly.
+	if n&(n-1) == 0 {
+		return uint16(fastUint64()) & (n - 1)
+	}
+	// Rejection sampling with bitmask.
+	mask := uint16(1<<16 - 1)
+	threshold := mask - (mask % n)
+	for {
+		v := uint16(fastUint64())
+		if v < threshold || threshold == 0 {
+			return v % n
+		}
+	}
+}
+
+// fastUint8N returns a random uint8 in [0, n).
+func fastUint8N(n uint8) uint8 {
+	if n == 0 {
+		panic("fastrand: argument n must be positive")
+	}
+	if n == 1 {
+		return 0
+	}
+	if n&(n-1) == 0 {
+		return uint8(fastUint64()) & (n - 1)
+	}
+	mask := uint8(1<<8 - 1)
+	threshold := mask - (mask % n)
+	for {
+		v := uint8(fastUint64())
+		if v < threshold || threshold == 0 {
+			return v % n
+		}
+	}
+}
+
 func Int(min, max int) int {
 	if min > max {
 		panic(fmt.Sprintf("fastrand: invalid integer range [%d, %d]", min, max))
@@ -141,12 +194,25 @@ func IntN(n int) int {
 	return int(fastUint64N(uint64(n)))
 }
 
+// Uint16N returns a random uint16 in [0, n). It is faster than IntN
+// for small ranges because it uses a lightweight rejection path.
+func Uint16N(n uint16) uint16 {
+	return fastUint16N(n)
+}
+
+// Uint8N returns a random uint8 in [0, n).
+func Uint8N(n uint8) uint8 {
+	return fastUint8N(n)
+}
+
+var emptyBytes = []byte{}
+
 func Bytes(length int) []byte {
 	if length < 0 {
 		panic("fastrand: length cannot be negative")
 	}
 	if length == 0 {
-		return []byte{}
+		return emptyBytes
 	}
 	b := make([]byte, length)
 	FillBytes(b)
@@ -293,6 +359,10 @@ func fillStringInto(b []byte, charset CharsList, csLen int) {
 			b[i] = charset[val&mask]
 			val >>= 8
 			used--
+		}
+	} else if csLen <= 256 {
+		for i := 0; i < len(b); i++ {
+			b[i] = charset[fastUint8N(uint8(csLen))]
 		}
 	} else {
 		for i := 0; i < len(b); i++ {
@@ -468,7 +538,7 @@ func SecureBytes(length int) ([]byte, error) {
 		return nil, errors.New("fastrand: length cannot be negative")
 	}
 	if length == 0 {
-		return []byte{}, nil
+		return emptyBytes, nil
 	}
 	b := make([]byte, length)
 	if err := SecureFillBytes(b); err != nil {
