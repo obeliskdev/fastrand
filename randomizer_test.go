@@ -6,8 +6,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/obeliskdev/fastrand"
 	"net"
+
+	"github.com/obeliskdev/fastrand"
 )
 
 func checkCharset(tb testing.TB, b []byte, charset []byte) {
@@ -181,7 +182,7 @@ func TestRandomizer(t *testing.T) {
 			name:        "NULL Bytes",
 			input:       "NUL:{RAND;7;NULL}",
 			expectedLen: map[string]int{"{RAND;7;NULL}": 7},
-			checkFunc:   map[string]func(testing.TB, []byte){"{RAND;7;NULL}": func(tb testing.TB, b []byte) { checkCharset(tb, b, fastrand.CharsList(fastrand.CharsNull)) }},
+			checkFunc:   map[string]func(testing.TB, []byte){"{RAND;7;NULL}": func(tb testing.TB, b []byte) { checkCharset(tb, b, fastrand.CharsNull) }},
 		},
 		{
 			name:        "IPv4",
@@ -329,7 +330,7 @@ func TestRandomizer(t *testing.T) {
 				isHex := hexRegex.Match(b)
 				isABL := true
 				for _, char := range b {
-					if !bytes.Contains([]byte(fastrand.CharsAlphabetLower), []byte{char}) {
+					if !bytes.Contains(fastrand.CharsAlphabetLower, []byte{char}) {
 						isABL = false
 						break
 					}
@@ -357,14 +358,14 @@ func TestRandomizer(t *testing.T) {
 				}
 				isDigit := true
 				for _, char := range b {
-					if !bytes.Contains([]byte(fastrand.CharsDigits), []byte{char}) {
+					if !bytes.Contains(fastrand.CharsDigits, []byte{char}) {
 						isDigit = false
 						break
 					}
 				}
 				isABL := true
 				for _, char := range b {
-					if !bytes.Contains([]byte(fastrand.CharsAlphabetLower), []byte{char}) {
+					if !bytes.Contains(fastrand.CharsAlphabetLower, []byte{char}) {
 						isABL = false
 						break
 					}
@@ -397,10 +398,9 @@ func TestRandomizer(t *testing.T) {
 						t.Errorf("Expected literal output %q for incomplete tag start, got %q", tc.input, resultStr)
 					}
 					return
-				} else {
-
-					t.Logf("Warning: Placeholders found by regex but none expected by test case '%s'", tc.name)
 				}
+
+				t.Logf("Warning: Placeholders found by regex but none expected by test case '%s'", tc.name)
 
 			} else if len(tc.expectedLen) > 0 && len(placeholderMatches) == 0 {
 				t.Fatalf("Test setup error: Placeholders expected but none found by regex in input: %q: %s", tc.input, resultStr)
@@ -713,6 +713,13 @@ func TestDefaultEngine(t *testing.T) {
 		}
 		if isHex && (len(result) < 10 || len(result) > 16) {
 			t.Errorf("HEX result has wrong length: %d", len(result))
+		}
+	})
+
+	t.Run("MalformedOptionalTagPreservesOM", func(t *testing.T) {
+		result := fastrand.RandomizerString("Value: {RANDOMfoo}")
+		if result != "Value: {RANDOMfoo}" {
+			t.Errorf("Expected malformed optional tag to round-trip, got %q", result)
 		}
 	})
 }

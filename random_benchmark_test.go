@@ -181,3 +181,59 @@ func BenchmarkRandomizer(b *testing.B) {
 		_ = fastrand.Randomizer(payload)
 	}
 }
+
+func BenchmarkRandomizerAppend(b *testing.B) {
+	engine := fastrand.NewEngine()
+	payload := []byte("User: {RAND;10-20;ABL,ABU} | Session: {RANDOM;32;HEX} | ID: {RAND;UUID,HEX} | IP: {RAND;IPV4} | Data: {RAND;50-99} --- End")
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		buf := make([]byte, 0, 512)
+		_ = engine.RandomizerAppend(buf, payload)
+	}
+}
+
+func BenchmarkFillBytes(b *testing.B) {
+	buf := make([]byte, 64)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		fastrand.FillBytes(buf)
+	}
+}
+
+func BenchmarkFillString(b *testing.B) {
+	buf := make([]byte, 32)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		fastrand.FillString(buf, fastrand.CharsAlphabetDigits)
+	}
+}
+
+func BenchmarkFillHex(b *testing.B) {
+	buf := make([]byte, 64)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		fastrand.FillHex(buf)
+	}
+}
+
+func BenchmarkSecureFillBytes(b *testing.B) {
+	buf := make([]byte, 64)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = fastrand.SecureFillBytes(buf)
+	}
+}
+
+func BenchmarkSecureFillString(b *testing.B) {
+	buf := make([]byte, 32)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = fastrand.SecureFillString(buf, fastrand.CharsAlphabetDigits)
+	}
+}

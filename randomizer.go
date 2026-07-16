@@ -3,13 +3,12 @@ package fastrand
 import (
 	"bytes"
 	_ "embed"
+	"encoding/binary"
 	"encoding/hex"
 	"html"
-	"math/rand"
 	"net/url"
 	"strings"
-
-	"github.com/valyala/bytebufferpool"
+	"unsafe"
 )
 
 type RandomizerEncoding int
@@ -54,7 +53,17 @@ func Randomizer(payload []byte) []byte {
 }
 
 func (e *FastEngine) RandomizerString(payload string) string {
-	return string(e.Randomizer([]byte(payload)))
+	if !strings.ContainsAny(payload, "{%&") && e.outputEncoding == RandomizerEncodingNone {
+		return payload
+	}
+	buf := make([]byte, 0, len(payload)+512)
+	if e.inputEncoding != RandomizerEncodingNone && strings.ContainsAny(payload, "%&") {
+		normalized := normalizeString(payload, e.inputEncoding)
+		e.randomizerInto(normalized, &buf)
+	} else {
+		e.randomizerInto([]byte(payload), &buf)
+	}
+	return string(buf)
 }
 
 func (e *FastEngine) Randomizer(payload []byte) []byte {
@@ -66,70 +75,99 @@ func (e *FastEngine) Randomizer(payload []byte) []byte {
 		payload = normalize(payload, e.inputEncoding)
 	}
 
-	buffer := bytebufferpool.Get()
-	defer bytebufferpool.Put(buffer)
+	buf := make([]byte, 0, len(payload)+512)
+	e.randomizerInto(payload, &buf)
+	return buf
+}
 
+func (e *FastEngine) RandomizerAppend(dst []byte, payload []byte) []byte {
+	if !bytes.ContainsAny(payload, "{%&") && e.outputEncoding == RandomizerEncodingNone {
+		return append(dst, payload...)
+	}
+	if e.inputEncoding != RandomizerEncodingNone && bytes.ContainsAny(payload, "%&") {
+		payload = normalize(payload, e.inputEncoding)
+	}
+	e.randomizerInto(payload, &dst)
+	return dst
+}
+
+func (e *FastEngine) randomizerInto(payload []byte, out *[]byte) {
 	cursor := 0
 	for {
 		startIndex := bytes.Index(payload[cursor:], startTag)
 		if startIndex == -1 {
-			e.writeEncoded(buffer, payload[cursor:])
-			break
+			e.writeEncoded(out, payload[cursor:])
+			return
 		}
 		startIndex += cursor
-		e.writeEncoded(buffer, payload[cursor:startIndex])
+		e.writeEncoded(out, payload[cursor:startIndex])
 
 		cursor = startIndex
 		endIndex := bytes.IndexByte(payload[cursor:], endTag)
 		if endIndex == -1 {
-			e.writeEncoded(buffer, payload[cursor:])
-			break
+			e.writeEncoded(out, payload[cursor:])
+			return
 		}
 		endIndex += cursor
 		tag := payload[cursor:endIndex]
 		cursor = endIndex + 1
 
-		e.parseAndReplaceFast(tag, buffer)
+		e.parseAndReplaceFast(tag, out)
 	}
-
-	result := append([]byte(nil), buffer.Bytes()...)
-	return result
 }
 
-func (e *FastEngine) writeEncoded(buffer *bytebufferpool.ByteBuffer, data []byte) {
+func (e *FastEngine) writeEncoded(out *[]byte, data []byte) {
 	if len(data) == 0 {
 		return
 	}
 	switch e.outputEncoding {
 	case RandomizerEncodingURL:
-		_, _ = buffer.WriteString(url.QueryEscape(string(data)))
+		*out = append(*out, url.QueryEscape(unsafeString(data))...)
 	case RandomizerEncodingHTML:
-		_, _ = buffer.WriteString(html.EscapeString(string(data)))
+		*out = append(*out, html.EscapeString(unsafeString(data))...)
 	default:
-		_, _ = buffer.Write(data)
+		*out = append(*out, data...)
 	}
 }
 
-func (e *FastEngine) parseAndReplaceFast(tag []byte, buffer *bytebufferpool.ByteBuffer) {
+func unsafeString(b []byte) string {
+	if len(b) == 0 {
+		return ""
+	}
+	return unsafe.String(&b[0], len(b))
+}
+
+func (e *FastEngine) parseAndReplaceFast(tag []byte, out *[]byte) {
 	tag = tag[len(startTag):]
+	hasOpt := false
 	if bytes.HasPrefix(tag, startTagOpt) {
 		tag = tag[len(startTagOpt):]
+		hasOpt = true
 	}
 
 	if len(tag) == 0 {
-		_, _ = buffer.WriteString(String(e.defaultLength, CharsAll))
+		appendString(out, e.defaultLength, e.getCharset(kwABR, CharsAll))
 		return
 	}
 
 	if tag[0] != sepTag {
-		tempBuf := bytebufferpool.Get()
-		defer bytebufferpool.Put(tempBuf)
-		_, _ = tempBuf.Write(startTag)
-		if bytes.HasPrefix(tag, startTagOpt) {
-			_, _ = tempBuf.Write(startTagOpt)
+		if e.outputEncoding == RandomizerEncodingNone {
+			*out = append(*out, startTag...)
+			if hasOpt {
+				*out = append(*out, startTagOpt...)
+			}
+			*out = append(*out, tag...)
+			*out = append(*out, endTag)
+			return
 		}
-		_, _ = tempBuf.Write(tag)
-		e.writeEncoded(buffer, tempBuf.Bytes())
+		tmp := make([]byte, 0, len(startTag)+boolToInt(hasOpt)*2+len(tag)+1)
+		tmp = append(tmp, startTag...)
+		if hasOpt {
+			tmp = append(tmp, startTagOpt...)
+		}
+		tmp = append(tmp, tag...)
+		tmp = append(tmp, endTag)
+		e.writeEncoded(out, tmp)
 		return
 	}
 	tag = tag[1:]
@@ -147,7 +185,8 @@ func (e *FastEngine) parseAndReplaceFast(tag []byte, buffer *bytebufferpool.Byte
 
 	var lengthParsed bool
 	if e.lengthChoicesEnabled && bytes.Contains(lenPart, []byte(",")) {
-		var validLengths []int
+		var validLengths [16]int
+		validCount := 0
 		start := 0
 		for {
 			idx := bytes.IndexByte(lenPart[start:], ',')
@@ -155,19 +194,21 @@ func (e *FastEngine) parseAndReplaceFast(tag []byte, buffer *bytebufferpool.Byte
 			if idx == -1 {
 				part = lenPart[start:]
 				if l, ok := parseLengthFast(part); ok && l >= e.minLength && l <= e.maxLength {
-					validLengths = append(validLengths, l)
+					validLengths[validCount] = l
+					validCount++
 				}
 				break
 			}
 			part = lenPart[start : start+idx]
 			if l, ok := parseLengthFast(part); ok && l >= e.minLength && l <= e.maxLength {
-				validLengths = append(validLengths, l)
+				validLengths[validCount] = l
+				validCount++
 			}
 			start += idx + 1
 		}
 
-		if len(validLengths) > 0 {
-			length = validLengths[rand.Intn(len(validLengths))]
+		if validCount > 0 {
+			length = validLengths[int(fastUint64N(uint64(validCount)))]
 			lengthParsed = true
 		}
 	}
@@ -179,7 +220,7 @@ func (e *FastEngine) parseAndReplaceFast(tag []byte, buffer *bytebufferpool.Byte
 			maxPart := lenPart[rangeSepIndex+1:]
 			if minX, ok1 := parseLengthFast(minPart); ok1 && minX >= e.minLength {
 				if maxX, ok2 := parseLengthFast(maxPart); ok2 && minX <= maxX && maxX <= e.maxLength {
-					length = rand.Intn(maxX-minX+1) + minX
+					length = int(fastUint64N(uint64(maxX-minX+1))) + minX
 					lengthParsed = true
 				}
 			}
@@ -199,104 +240,262 @@ func (e *FastEngine) parseAndReplaceFast(tag []byte, buffer *bytebufferpool.Byte
 	}
 
 	if e.keywordChoicesEnabled && bytes.Contains(typeKeyword, []byte(",")) {
-		var validChoices [][]byte
+		var validChoices [16][]byte
+		validCount := 0
 		start := 0
 		for {
 			idx := bytes.IndexByte(typeKeyword[start:], ',')
 			var choice []byte
 			if idx == -1 {
 				choice = typeKeyword[start:]
-				upcasedChoice := strings.ToUpper(string(choice))
-				_, isCustom := e.customKeywords[upcasedChoice]
-				isEnabled := e.enabledKeywords[upcasedChoice]
-				if isCustom || isEnabled {
-					validChoices = append(validChoices, choice)
+				if e.isKeywordValid(choice) {
+					validChoices[validCount] = choice
+					validCount++
 				}
 				break
 			}
 			choice = typeKeyword[start : start+idx]
-			upcasedChoice := strings.ToUpper(string(choice))
-			_, isCustom := e.customKeywords[upcasedChoice]
-			isEnabled := e.enabledKeywords[upcasedChoice]
-			if isCustom || isEnabled {
-				validChoices = append(validChoices, choice)
+			if e.isKeywordValid(choice) {
+				validChoices[validCount] = choice
+				validCount++
 			}
 			start += idx + 1
 		}
-		if len(validChoices) > 0 {
-			typeKeyword = validChoices[rand.Intn(len(validChoices))]
+		if validCount > 0 {
+			typeKeyword = validChoices[int(fastUint64N(uint64(validCount)))]
 		}
 	}
 
-	upcasedKeyword := strings.ToUpper(string(typeKeyword))
-	if customGen, exists := e.customKeywords[upcasedKeyword]; exists {
-		_, _ = buffer.Write(customGen(length))
-		return
+	if len(e.customKeywords) > 0 {
+		var key [16]byte
+		n := upperASCIIInto(key[:], typeKeyword)
+		if customGen, exists := e.customKeywords[string(key[:n])]; exists {
+			*out = append(*out, customGen(length)...)
+			return
+		}
 	}
 
-	if enabled, exists := e.enabledKeywords[upcasedKeyword]; !exists || !enabled {
-		_, _ = buffer.WriteString(String(length, e.getCharset(kwABR, CharsAll)))
+	if !e.isBuiltinKeywordEnabled(typeKeyword) {
+		appendString(out, length, e.getCharset(kwABR, CharsAll))
 		return
 	}
 
 	switch {
-	case bytes.EqualFold(typeKeyword, kwABL):
-		_, _ = buffer.WriteString(String(length, e.getCharset(kwABL, CharsAlphabetLower)))
-	case bytes.EqualFold(typeKeyword, kwABU):
-		_, _ = buffer.WriteString(String(length, e.getCharset(kwABU, CharsAlphabetUpper)))
-	case bytes.EqualFold(typeKeyword, kwABR):
-		_, _ = buffer.WriteString(String(length, e.getCharset(kwABR, CharsAlphabet)))
-	case bytes.EqualFold(typeKeyword, kwDIGIT):
-		_, _ = buffer.WriteString(String(length, e.getCharset(kwDIGIT, CharsDigits)))
-	case bytes.EqualFold(typeKeyword, kwNULL):
+	case bytesEqualFold(typeKeyword, kwABL):
+		appendString(out, length, e.getCharset(kwABL, CharsAlphabetLower))
+	case bytesEqualFold(typeKeyword, kwABU):
+		appendString(out, length, e.getCharset(kwABU, CharsAlphabetUpper))
+	case bytesEqualFold(typeKeyword, kwABR):
+		appendString(out, length, e.getCharset(kwABR, CharsAlphabet))
+	case bytesEqualFold(typeKeyword, kwDIGIT):
+		appendString(out, length, e.getCharset(kwDIGIT, CharsDigits))
+	case bytesEqualFold(typeKeyword, kwNULL):
 		nullCharset := e.getCharset(kwNULL, CharsNull)
 		for i := 0; i < length; i++ {
-			_ = buffer.WriteByte(Choice(nullCharset))
+			*out = append(*out, nullCharset[int(fastUint64N(uint64(len(nullCharset))))])
 		}
-	case bytes.EqualFold(typeKeyword, kwSPACE):
+	case bytesEqualFold(typeKeyword, kwSPACE):
 		for i := 0; i < length; i++ {
-			_ = buffer.WriteByte(' ')
+			*out = append(*out, ' ')
 		}
-	case bytes.EqualFold(typeKeyword, kwUUID):
-		_, _ = buffer.Write(generateUUID())
-	case bytes.EqualFold(typeKeyword, kwBYTES):
-		_, _ = buffer.Write(Bytes(length))
-	case bytes.EqualFold(typeKeyword, kwIPV4):
-		_, _ = buffer.WriteString(IPv4().String())
-	case bytes.EqualFold(typeKeyword, kwIPV6):
-		_, _ = buffer.WriteString(IPv6().String())
-	case bytes.EqualFold(typeKeyword, kwEMAIL):
-		_, _ = buffer.Write(e.generateRandomEmail(length))
-	case bytes.EqualFold(typeKeyword, kwHEX):
-		_, _ = buffer.Write(generateRandomHex(length, e.defaultLength))
+	case bytesEqualFold(typeKeyword, kwUUID):
+		appendUUID(out)
+	case bytesEqualFold(typeKeyword, kwBYTES):
+		*out = append(*out, Bytes(length)...)
+	case bytesEqualFold(typeKeyword, kwIPV4):
+		appendIPv4(out)
+	case bytesEqualFold(typeKeyword, kwIPV6):
+		appendIPv6(out)
+	case bytesEqualFold(typeKeyword, kwEMAIL):
+		e.appendRandomEmail(out, length)
+	case bytesEqualFold(typeKeyword, kwHEX):
+		appendHex(out, length, e.defaultLength)
 	default:
-		_, _ = buffer.WriteString(String(length, e.getCharset(kwABR, CharsAll)))
+		appendString(out, length, e.getCharset(kwABR, CharsAll))
 	}
 }
 
-func (e *FastEngine) getCharset(keyword []byte, fallback CharsList) CharsList {
-	if cs, ok := e.customCharsets[string(keyword)]; ok {
-		return cs
-	}
-	return fallback
+func (e *FastEngine) isBuiltinKeywordEnabled(keyword []byte) bool {
+	var key [16]byte
+	n := upperASCIIInto(key[:], keyword)
+	enabled, exists := e.enabledKeywords[string(key[:n])]
+	return exists && enabled
 }
 
-func (e *FastEngine) generateRandomEmail(userLength int) []byte {
+func upperASCIIInto(dst, src []byte) int {
+	n := len(src)
+	if n > len(dst) {
+		n = len(dst)
+	}
+	for i := 0; i < n; i++ {
+		c := src[i]
+		if c >= 'a' && c <= 'z' {
+			c -= 32
+		}
+		dst[i] = c
+	}
+	return n
+}
+
+func bytesEqualFold(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := 0; i < len(a); i++ {
+		ca := a[i]
+		cb := b[i]
+		if ca >= 'a' && ca <= 'z' {
+			ca -= 32
+		}
+		if cb >= 'a' && cb <= 'z' {
+			cb -= 32
+		}
+		if ca != cb {
+			return false
+		}
+	}
+	return true
+}
+
+func (e *FastEngine) isKeywordValid(choice []byte) bool {
+	var key [16]byte
+	n := upperASCIIInto(key[:], choice)
+	k := string(key[:n])
+	if _, isCustom := e.customKeywords[k]; isCustom {
+		return true
+	}
+	isEnabled := e.enabledKeywords[k]
+	return isEnabled
+}
+
+func ensureCap(out *[]byte, n int) {
+	if cap(*out) < n {
+		bigger := make([]byte, len(*out), n+128)
+		copy(bigger, *out)
+		*out = bigger
+	}
+}
+
+func appendString(out *[]byte, length int, charset CharsList) {
+	if length <= 0 {
+		return
+	}
+	csLen := len(charset)
+	if csLen == 0 {
+		return
+	}
+	start := len(*out)
+	ensureCap(out, start+length)
+	*out = (*out)[:start+length]
+	fillStringInto((*out)[start:], charset, csLen)
+}
+
+func appendUUID(out *[]byte) {
+	var raw [16]byte
+	FillBytes(raw[:])
+	raw[6] = (raw[6] & 0x0f) | 0x40
+	raw[8] = (raw[8] & 0x3f) | 0x80
+	start := len(*out)
+	ensureCap(out, start+36)
+	*out = (*out)[:start+36]
+	b := (*out)[start:]
+	hex.Encode(b[0:8], raw[0:4])
+	b[8] = '-'
+	hex.Encode(b[9:13], raw[4:6])
+	b[13] = '-'
+	hex.Encode(b[14:18], raw[6:8])
+	b[18] = '-'
+	hex.Encode(b[19:23], raw[8:10])
+	b[23] = '-'
+	hex.Encode(b[24:], raw[10:])
+}
+
+func appendHex(out *[]byte, byteLength, defaultLen int) {
+	if byteLength <= 0 {
+		byteLength = defaultLen
+	}
+	hexLen := byteLength * 2
+	start := len(*out)
+	ensureCap(out, start+hexLen)
+	*out = (*out)[:start+hexLen]
+	FillHex((*out)[start:])
+}
+
+func appendIPv4(out *[]byte) {
+	var raw [4]byte
+	FillBytes(raw[:])
+	*out = strconvAppendUint(*out, uint64(raw[0]), 10)
+	*out = append(*out, '.')
+	*out = strconvAppendUint(*out, uint64(raw[1]), 10)
+	*out = append(*out, '.')
+	*out = strconvAppendUint(*out, uint64(raw[2]), 10)
+	*out = append(*out, '.')
+	*out = strconvAppendUint(*out, uint64(raw[3]), 10)
+}
+
+func appendIPv6(out *[]byte) {
+	var raw [16]byte
+	FillBytes(raw[:])
+	for i := 0; i < 8; i++ {
+		if i > 0 {
+			*out = append(*out, ':')
+		}
+		val := binary.BigEndian.Uint16(raw[i*2:])
+		*out = strconvAppendUint(*out, uint64(val), 16)
+	}
+}
+
+func (e *FastEngine) appendRandomEmail(out *[]byte, userLength int) {
 	if userLength <= 0 {
 		userLength = 8
 	}
-	user := String(userLength, e.getCharset(kwABL, CharsAlphabetLower))
 	provider := "gmail.com"
 	if len(e.mailProviders) > 0 {
-		provider = Choice(e.mailProviders)
+		provider = e.mailProviders[int(fastUint64N(uint64(len(e.mailProviders))))]
 	}
+	totalLen := userLength + 1 + len(provider)
+	start := len(*out)
+	ensureCap(out, start+totalLen)
+	*out = (*out)[:start+totalLen]
+	b := (*out)[start:]
+	fillStringInto(b[:userLength], e.getCharset(kwABL, CharsAlphabetLower), len(CharsAlphabetLower))
+	b[userLength] = '@'
+	copy(b[userLength+1:], provider)
+}
 
-	emailLen := len(user) + 1 + len(provider)
-	b := make([]byte, emailLen)
-	copy(b, user)
-	b[len(user)] = '@'
-	copy(b[len(user)+1:], provider)
-	return b
+func strconvAppendUint(b []byte, val uint64, base int) []byte {
+	var buf [20]byte
+	pos := strconvPutUint(buf[:], val, base)
+	return append(b, buf[pos:]...)
+}
+
+func strconvPutUint(buf []byte, val uint64, base int) int {
+	if val == 0 {
+		buf[len(buf)-1] = '0'
+		return len(buf) - 1
+	}
+	const digits = "0123456789abcdef"
+	pos := len(buf)
+	for val > 0 {
+		pos--
+		buf[pos] = digits[val%uint64(base)]
+		val /= uint64(base)
+	}
+	return pos
+}
+
+func boolToInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+func (e *FastEngine) getCharset(keyword []byte, fallback CharsList) CharsList {
+	if cs, ok := e.customCharsets[unsafeString(keyword)]; ok {
+		return cs
+	}
+	return fallback
 }
 
 var (
@@ -325,56 +524,57 @@ var (
 )
 
 func normalize(payload []byte, encodingFlags RandomizerEncoding) []byte {
-	normalizedBuf := bytebufferpool.Get()
-	defer bytebufferpool.Put(normalizedBuf)
+	var buf []byte
+	if cap(buf) < len(payload) {
+		buf = make([]byte, 0, len(payload))
+	}
 
 	cursor := 0
 	for cursor < len(payload) {
 		idx := bytes.IndexAny(payload[cursor:], "%&")
 		if idx == -1 {
-			_, _ = normalizedBuf.Write(payload[cursor:])
+			buf = append(buf, payload[cursor:]...)
 			break
 		}
-		_, _ = normalizedBuf.Write(payload[cursor : cursor+idx])
+		buf = append(buf, payload[cursor:cursor+idx]...)
 		cursor += idx
 
 		char := payload[cursor]
 
 		if char == '%' && (encodingFlags&RandomizerEncodingURL != 0) {
 			if hasPrefix(payload, startUrlEncoded, cursor) {
-				_, _ = normalizedBuf.Write(startTag)
+				buf = append(buf, startTag...)
 				cursor += len(startUrlEncoded)
 			} else if hasPrefix(payload, endTagUrl, cursor) {
-				_ = normalizedBuf.WriteByte(endTag)
+				buf = append(buf, endTag)
 				cursor += len(endTagUrl)
 			} else if hasPrefix(payload, sepTagUrl, cursor) {
-				_ = normalizedBuf.WriteByte(sepTag)
+				buf = append(buf, sepTag)
 				cursor += len(sepTagUrl)
 			} else {
-				_ = normalizedBuf.WriteByte(payload[cursor])
+				buf = append(buf, payload[cursor])
 				cursor++
 			}
 		} else if char == '&' && (encodingFlags&RandomizerEncodingHTML != 0) {
 			if hasPrefix(payload, startHtmlEncoded, cursor) {
-				_, _ = normalizedBuf.Write(startTag)
+				buf = append(buf, startTag...)
 				cursor += len(startHtmlEncoded)
 			} else if hasPrefix(payload, endTagHtml, cursor) {
-				_ = normalizedBuf.WriteByte(endTag)
+				buf = append(buf, endTag)
 				cursor += len(endTagHtml)
 			} else if hasPrefix(payload, sepTagHtml, cursor) {
-				_ = normalizedBuf.WriteByte(sepTag)
+				buf = append(buf, sepTag)
 				cursor += len(sepTagHtml)
 			} else {
-				_ = normalizedBuf.WriteByte(payload[cursor])
+				buf = append(buf, payload[cursor])
 				cursor++
 			}
 		} else {
-			_ = normalizedBuf.WriteByte(payload[cursor])
+			buf = append(buf, payload[cursor])
 			cursor++
 		}
 	}
-	result := append([]byte(nil), normalizedBuf.Bytes()...)
-	return result
+	return buf
 }
 
 func hasPrefix(slice, prefix []byte, pos int) bool {
@@ -384,19 +584,61 @@ func hasPrefix(slice, prefix []byte, pos int) bool {
 	return bytes.Equal(slice[pos:pos+len(prefix)], prefix)
 }
 
-func generateUUID() []byte {
-	uuid, _ := FastUUID()
-	b := make([]byte, 36)
-	hex.Encode(b[0:8], uuid[0:4])
-	b[8] = '-'
-	hex.Encode(b[9:13], uuid[4:6])
-	b[13] = '-'
-	hex.Encode(b[14:18], uuid[6:8])
-	b[18] = '-'
-	hex.Encode(b[19:23], uuid[8:10])
-	b[23] = '-'
-	hex.Encode(b[24:], uuid[10:])
-	return b
+func hasPrefixString(s string, prefix string, pos int) bool {
+	if pos+len(prefix) > len(s) {
+		return false
+	}
+	return s[pos:pos+len(prefix)] == prefix
+}
+
+func normalizeString(payload string, encodingFlags RandomizerEncoding) []byte {
+	buf := make([]byte, 0, len(payload))
+	cursor := 0
+	for cursor < len(payload) {
+		idx := strings.IndexAny(payload[cursor:], "%&")
+		if idx == -1 {
+			buf = append(buf, payload[cursor:]...)
+			break
+		}
+		buf = append(buf, payload[cursor:cursor+idx]...)
+		cursor += idx
+
+		char := payload[cursor]
+
+		if char == '%' && (encodingFlags&RandomizerEncodingURL != 0) {
+			if hasPrefixString(payload, string(startUrlEncoded), cursor) {
+				buf = append(buf, startTag...)
+				cursor += len(startUrlEncoded)
+			} else if hasPrefixString(payload, string(endTagUrl), cursor) {
+				buf = append(buf, endTag)
+				cursor += len(endTagUrl)
+			} else if hasPrefixString(payload, string(sepTagUrl), cursor) {
+				buf = append(buf, sepTag)
+				cursor += len(sepTagUrl)
+			} else {
+				buf = append(buf, payload[cursor])
+				cursor++
+			}
+		} else if char == '&' && (encodingFlags&RandomizerEncodingHTML != 0) {
+			if hasPrefixString(payload, string(startHtmlEncoded), cursor) {
+				buf = append(buf, startTag...)
+				cursor += len(startHtmlEncoded)
+			} else if hasPrefixString(payload, string(endTagHtml), cursor) {
+				buf = append(buf, endTag)
+				cursor += len(endTagHtml)
+			} else if hasPrefixString(payload, string(sepTagHtml), cursor) {
+				buf = append(buf, sepTag)
+				cursor += len(sepTagHtml)
+			} else {
+				buf = append(buf, payload[cursor])
+				cursor++
+			}
+		} else {
+			buf = append(buf, payload[cursor])
+			cursor++
+		}
+	}
+	return buf
 }
 
 func parseLengthFast(b []byte) (int, bool) {
@@ -413,14 +655,4 @@ func parseLengthFast(b []byte) (int, bool) {
 		}
 	}
 	return 0, false
-}
-
-func generateRandomHex(byteLength, defaultLen int) []byte {
-	if byteLength <= 0 {
-		byteLength = defaultLen
-	}
-	srcBytes := Bytes(byteLength)
-	hexBytes := make([]byte, byteLength*2)
-	hex.Encode(hexBytes, srcBytes)
-	return hexBytes
 }

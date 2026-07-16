@@ -10,8 +10,8 @@ import (
 	"math/bits"
 	"math/rand/v2"
 	"net"
-	"sync/atomic"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 )
@@ -78,18 +78,15 @@ type randReader struct {
 
 func (r *randReader) Read(p []byte) (n int, err error) {
 	n = len(p)
-	read := 0
-	for read < n {
+	i := 0
+	for ; i+8 <= n; i += 8 {
+		binary.LittleEndian.PutUint64(p[i:], r.next())
+	}
+	if i < n {
 		val := r.next()
-		remaining := n - read
-		if remaining >= 8 {
-			binary.LittleEndian.PutUint64(p[read:], val)
-			read += 8
-		} else {
-			var tempBuf [8]byte
-			binary.LittleEndian.PutUint64(tempBuf[:], val)
-			copy(p[read:], tempBuf[:remaining])
-			read += remaining
+		for ; i < n; i++ {
+			p[i] = byte(val)
+			val >>= 8
 		}
 	}
 	return n, nil
@@ -152,10 +149,23 @@ func Bytes(length int) []byte {
 		return []byte{}
 	}
 	b := make([]byte, length)
-	if _, err := FastReader.Read(b); err != nil {
-		panic(fmt.Sprintf("fastrand: failed to read random bytes: %v", err))
-	}
+	FillBytes(b)
 	return b
+}
+
+func FillBytes(buf []byte) {
+	i := 0
+	for ; i+8 <= len(buf); i += 8 {
+		binary.LittleEndian.PutUint64(buf[i:], fastUint64())
+	}
+
+	if i < len(buf) {
+		val := fastUint64()
+		for ; i < len(buf); i++ {
+			buf[i] = byte(val)
+			val >>= 8
+		}
+	}
 }
 
 func Hex(length int) string {
@@ -165,20 +175,86 @@ func Hex(length int) string {
 	if length == 0 {
 		return ""
 	}
-	src := Bytes(length)
-	dst := make([]byte, hex.EncodedLen(len(src)))
-	hex.Encode(dst, src)
-	return *(*string)(unsafe.Pointer(&dst))
+	b := make([]byte, hex.EncodedLen(length))
+	FillHex(b)
+	return *(*string)(unsafe.Pointer(&b))
+}
+
+func FillHex(dst []byte) {
+	hexLen := len(dst)
+	if hexLen == 0 {
+		return
+	}
+	if hexLen&1 != 0 {
+		panic("fastrand: FillHex dst length must be even")
+	}
+	n := hexLen >> 1
+	i := 0
+	for ; i+8 <= n; i += 8 {
+		var raw [8]byte
+		binary.LittleEndian.PutUint64(raw[:], fastUint64())
+		hex.Encode(dst[(i<<1):], raw[:])
+	}
+	if i < n {
+		remaining := n - i
+		var raw [8]byte
+		var val uint64
+		for j := 0; j < remaining; j++ {
+			if j&7 == 0 {
+				val = fastUint64()
+			}
+			raw[j] = byte(val)
+			val >>= 8
+		}
+		hex.Encode(dst[(i<<1):], raw[:remaining])
+	}
 }
 
 func SecureHex(length int) (string, error) {
-	bytes, err := SecureBytes(length)
-	if err != nil {
-		return "", fmt.Errorf("fastrand: failed to generate secure hex: %w", err)
+	if length < 0 {
+		return "", errors.New("fastrand: length cannot be negative")
 	}
-	dst := make([]byte, hex.EncodedLen(len(bytes)))
-	hex.Encode(dst, bytes)
-	return *(*string)(unsafe.Pointer(&dst)), nil
+	if length == 0 {
+		return "", nil
+	}
+	b := make([]byte, hex.EncodedLen(length))
+	if err := SecureFillHex(b); err != nil {
+		return "", err
+	}
+	return *(*string)(unsafe.Pointer(&b)), nil
+}
+
+func SecureFillHex(dst []byte) error {
+	hexLen := len(dst)
+	if hexLen == 0 {
+		return nil
+	}
+	if hexLen&1 != 0 {
+		return errors.New("fastrand: SecureFillHex dst length must be even")
+	}
+	n := hexLen >> 1
+	chaChaMu.Lock()
+	defer chaChaMu.Unlock()
+	i := 0
+	for ; i+8 <= n; i += 8 {
+		var raw [8]byte
+		binary.LittleEndian.PutUint64(raw[:], chaChaSrc.Uint64())
+		hex.Encode(dst[(i<<1):], raw[:])
+	}
+	if i < n {
+		remaining := n - i
+		var raw [8]byte
+		var val uint64
+		for j := 0; j < remaining; j++ {
+			if j&7 == 0 {
+				val = chaChaSrc.Uint64()
+			}
+			raw[j] = byte(val)
+			val >>= 8
+		}
+		hex.Encode(dst[(i<<1):], raw[:remaining])
+	}
+	return nil
 }
 
 func String(length int, charset CharsList) string {
@@ -193,19 +269,43 @@ func String(length int, charset CharsList) string {
 	}
 
 	b := make([]byte, length)
-
-	for i := 0; i < length; i++ {
-		b[i] = charset[IntN(csLen)]
-	}
-
+	fillStringInto(b, charset, csLen)
 	return *(*string)(unsafe.Pointer(&b))
+}
+
+func FillString(buf []byte, charset CharsList) {
+	if len(charset) == 0 {
+		panic("fastrand: charset must not be empty")
+	}
+	fillStringInto(buf, charset, len(charset))
+}
+
+func fillStringInto(b []byte, charset CharsList, csLen int) {
+	if csLen&(csLen-1) == 0 {
+		mask := uint64(csLen - 1)
+		var val uint64
+		var used int
+		for i := 0; i < len(b); i++ {
+			if used == 0 {
+				val = fastUint64()
+				used = 8
+			}
+			b[i] = charset[val&mask]
+			val >>= 8
+			used--
+		}
+	} else {
+		for i := 0; i < len(b); i++ {
+			b[i] = charset[int(fastUint64N(uint64(csLen)))]
+		}
+	}
 }
 
 func Choice[T any](items []T) T {
 	if len(items) == 0 {
 		panic("fastrand: cannot choose from an empty slice")
 	}
-	return items[IntN(len(items))]
+	return items[int(fastUint64N(uint64(len(items))))]
 }
 
 func ChoiceKey[T comparable, V any](items map[T]V) T {
@@ -213,7 +313,7 @@ func ChoiceKey[T comparable, V any](items map[T]V) T {
 		panic("fastrand: cannot choose from an empty map")
 	}
 
-	i := IntN(len(items))
+	i := int(fastUint64N(uint64(len(items))))
 	for k := range items {
 		if i == 0 {
 			return k
@@ -228,11 +328,11 @@ func ChoiceItemNullable[T any](slice []T) (*T, error) {
 	if len(slice) == 0 {
 		return nil, errors.New("fastrand: cannot choose from an empty slice")
 	}
-	return &slice[IntN(len(slice))], nil
+	return &slice[int(fastUint64N(uint64(len(slice))))], nil
 }
 
 func Bool() bool {
-	return IntN(2) == 1
+	return fastUint64()&1 == 1
 }
 
 func ChoiceMultiple[T any](items []T, count int) []T {
@@ -251,18 +351,13 @@ func ChoiceMultiple[T any](items []T, count int) []T {
 	}
 
 	chosen := make([]T, count)
-
-	indices := make([]int, n)
-	for i := 0; i < n; i++ {
-		indices[i] = i
-	}
-
-	Shuffle(n, func(i, j int) {
-		indices[i], indices[j] = indices[j], indices[i]
-	})
+	pool := make([]T, n)
+	copy(pool, items)
 
 	for i := 0; i < count; i++ {
-		chosen[i] = items[indices[i]]
+		j := i + int(fastUint64N(uint64(n-i)))
+		pool[i], pool[j] = pool[j], pool[i]
+		chosen[i] = pool[i]
 	}
 
 	return chosen
@@ -323,13 +418,25 @@ func NumberN[T number](n T) T {
 }
 
 func Shuffle(n int, swap func(i, j int)) {
-	r := rand.New(rand.NewPCG(fastUint64(), fastUint64()))
-	r.Shuffle(n, swap)
+	if n <= 1 {
+		return
+	}
+	for i := n - 1; i > 0; i-- {
+		j := int(fastUint64N(uint64(i + 1)))
+		swap(i, j)
+	}
 }
 
 func Perm(n int) []int {
-	r := rand.New(rand.NewPCG(fastUint64(), fastUint64()))
-	return r.Perm(n)
+	p := make([]int, n)
+	for i := 0; i < n; i++ {
+		p[i] = i
+	}
+	for i := n - 1; i > 0; i-- {
+		j := int(fastUint64N(uint64(i + 1)))
+		p[i], p[j] = p[j], p[i]
+	}
+	return p
 }
 
 func SecureInt(min, max int) (int, error) {
@@ -364,11 +471,27 @@ func SecureBytes(length int) ([]byte, error) {
 		return []byte{}, nil
 	}
 	b := make([]byte, length)
-	_, err := SecureReader.Read(b)
-	if err != nil {
-		return nil, fmt.Errorf("fastrand: failed to generate secure random bytes: %w", err)
+	if err := SecureFillBytes(b); err != nil {
+		return nil, err
 	}
 	return b, nil
+}
+
+func SecureFillBytes(buf []byte) error {
+	chaChaMu.Lock()
+	defer chaChaMu.Unlock()
+	i := 0
+	for ; i+8 <= len(buf); i += 8 {
+		binary.LittleEndian.PutUint64(buf[i:], chaChaSrc.Uint64())
+	}
+	if i < len(buf) {
+		val := chaChaSrc.Uint64()
+		for ; i < len(buf); i++ {
+			buf[i] = byte(val)
+			val >>= 8
+		}
+	}
+	return nil
 }
 
 func SecureString(length int, charset CharsList) (string, error) {
@@ -383,15 +506,23 @@ func SecureString(length int, charset CharsList) (string, error) {
 	}
 
 	b := make([]byte, length)
-
-	chaChaMu.Lock()
-	for i := range b {
-		idx := chaChaSrc.IntN(csLen)
-		b[i] = charset[idx]
+	if err := SecureFillString(b, charset); err != nil {
+		return "", err
 	}
-	chaChaMu.Unlock()
-
 	return *(*string)(unsafe.Pointer(&b)), nil
+}
+
+func SecureFillString(buf []byte, charset CharsList) error {
+	csLen := len(charset)
+	if csLen == 0 {
+		return errors.New("fastrand: charset must not be empty")
+	}
+	chaChaMu.Lock()
+	defer chaChaMu.Unlock()
+	for i := range buf {
+		buf[i] = charset[chaChaSrc.IntN(csLen)]
+	}
+	return nil
 }
 
 func SecureIPv4() (net.IP, error) {

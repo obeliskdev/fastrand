@@ -71,6 +71,33 @@ func main() {
 - `SecureString(length int, charset CharsList) (string, error)`
 - `SecureHex(length int) (string, error)`
 
+### Zero-allocation fill APIs
+
+Write random data directly into a caller-provided buffer. No heap allocations.
+
+- `FillBytes(buf []byte)` — fill with random bytes
+- `FillString(buf []byte, charset CharsList)` — fill with random chars from charset
+- `FillHex(dst []byte)` — fill with hex-encoded random bytes (dst len must be even)
+- `SecureFillBytes(buf []byte) error` — fill with secure random bytes
+- `SecureFillString(buf []byte, charset CharsList) error` — fill with secure random chars
+- `SecureFillHex(dst []byte) error` — fill with hex-encoded secure random bytes
+
+```go
+buf := make([]byte, 32)
+fastrand.FillString(buf, fastrand.CharsAlphabetDigits)
+// buf now contains 32 random alphanumeric chars, zero allocations
+```
+
+### Randomizer append API
+
+- `(*FastEngine) RandomizerAppend(dst, payload []byte) []byte` — append randomized output to `dst`, zero allocations when `dst` has sufficient capacity
+
+```go
+engine := fastrand.NewEngine()
+dst := make([]byte, 0, 512)
+result := engine.RandomizerAppend(dst, []byte("user={RAND;8;ABL}&id={RAND;UUID}"))
+```
+
 ### Collections
 
 - `Choice[T any](items []T) T`
